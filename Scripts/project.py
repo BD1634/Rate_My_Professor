@@ -382,131 +382,268 @@ if data_loaded:
             st.info("No statistically significant gender differences in tags were found.")
     
     # TAB 3: Rating Models  
-    with tab3:
-        st.header("Rating Prediction Models")
-        st.subheader("Analyzing factors that influence ratings")
+with tab3:
+    st.header("Rating Prediction Models")
+    st.subheader("Analyzing factors that influence ratings")
+    
+    target_column = "Average Rating"
+    
+    # Handle missing values more thoroughly
+    # First check percentage of missing values
+    missing_percentage = cap_num["Average Difficulty"].isna().mean() * 100
+    st.info(f"Missing values in 'Average Difficulty': {missing_percentage:.2f}%")
+    
+    # Handle missing values
+    missing_removal_mask = cap_num["Average Difficulty"].isna()
+    filtered_cap_num = cap_num[~missing_removal_mask].reset_index(drop=True)
+    
+    # Handle missing values in Proportion Would Take Again
+    temp_target_column = "Proportion Would Take Again"
+    na_mask = filtered_cap_num[temp_target_column].isna()
+    na_percentage = na_mask.mean() * 100
+    
+    if sum(na_mask) > 0:
+        st.info(f"Imputing missing values for 'Proportion Would Take Again' ({na_percentage:.2f}% missing)")
+        sub_train_data = filtered_cap_num[~na_mask]
         
-        target_column = "Average Rating"
-        # Handle missing values
-        missing_removal_mask = cap_num["Average Difficulty"].isna()
-        filtered_cap_num = cap_num[~missing_removal_mask].reset_index(drop=True)
+        # Use a simple imputer first to avoid issues with the SVR
+        simple_imputer_value = sub_train_data[temp_target_column].median()
+        filtered_cap_num.loc[na_mask, temp_target_column] = simple_imputer_value
         
-        temp_target_column = "Proportion Would Take Again"
-        na_mask = filtered_cap_num["Proportion Would Take Again"].isna()
+        # Now use SVR for more sophisticated imputation if there are enough samples
+        if len(sub_train_data) > 20:  # Only use SVR if we have enough data
+            try:
+                missing_imputer = SVR()
+                # Use only numeric columns for prediction
+                numeric_cols = sub_train_data.select_dtypes(include=['float64', 'int64']).columns
+                numeric_cols = [col for col in numeric_cols if col != temp_target_column]
+                
+                missing_imputer.fit(sub_train_data[numeric_cols], sub_train_data[temp_target_column])
+                temp_indices = filtered_cap_num[na_mask].index
+                filtered_cap_num.loc[temp_indices, temp_target_column] = missing_imputer.predict(
+                    filtered_cap_num.loc[temp_indices, numeric_cols]
+                )
+                st.success("Successfully imputed missing values using SVR")
+            except Exception as e:
+                st.error(f"Error during SVR imputation: {e}. Using median imputation instead.")
+    
+    # Examine target distribution
+    st.subheader("Target Variable Distribution")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.histplot(filtered_cap_num[target_column], kde=True, ax=ax)
+    ax.set_title(f"Distribution of {target_column}", fontsize=15)
+    ax.set_xlabel(target_column, fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    st.pyplot(fig)
+    
+    # Check for outliers
+    Q1 = filtered_cap_num[target_column].quantile(0.25)
+    Q3 = filtered_cap_num[target_column].quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    
+    outliers = filtered_cap_num[(filtered_cap_num[target_column] < lower_bound) | 
+                               (filtered_cap_num[target_column] > upper_bound)]
+    
+    if len(outliers) > 0:
+        st.warning(f"Detected {len(outliers)} outliers in the target variable")
         
-        if sum(na_mask) > 0:
-            st.info("Imputing missing values for 'Proportion Would Take Again'")
-            sub_train_data = filtered_cap_num[~na_mask]
-            
-            missing_imputer = SVR()
-            missing_imputer.fit(sub_train_data.drop(columns=[temp_target_column]), sub_train_data[temp_target_column])
-            temp_indices = filtered_cap_num[na_mask].index
-            filtered_cap_num.loc[temp_indices, temp_target_column] = missing_imputer.predict(filtered_cap_num.loc[temp_indices, :].drop(columns=[temp_target_column]))
+        # Option to remove outliers
+        remove_outliers = st.checkbox("Remove outliers for model training")
+        if remove_outliers:
+            filtered_cap_num = filtered_cap_num[(filtered_cap_num[target_column] >= lower_bound) & 
+                                              (filtered_cap_num[target_column] <= upper_bound)]
+            st.success(f"Removed {len(outliers)} outliers. Working with {len(filtered_cap_num)} data points.")
+    
+    # Correlation heatmap
+    st.subheader("Feature Correlation Matrix")
+    fig, ax = plt.subplots(figsize=(10, 8))
+    correlation_matrix = filtered_cap_num.corr()
+    
+    # Correlation with target
+    target_correlations = correlation_matrix[target_column].drop(target_column).sort_values(ascending=False)
+    st.write("Correlations with target variable:")
+    st.write(target_correlations)
+    
+    # Plot heatmap
+    sns.heatmap(correlation_matrix, center=0, annot=True, cmap="coolwarm", ax=ax)
+    st.pyplot(fig)
+    
+    # Feature selection options
+    st.subheader("Feature Selection")
+    min_correlation = st.slider("Minimum absolute correlation with target", 0.0, 1.0, 0.1, 0.05)
+    
+    # Select features based on correlation
+    selected_features = target_correlations[abs(target_correlations) >= min_correlation].index.tolist()
+    
+    if not selected_features:
+        st.error("No features meet the correlation threshold. Using all features.")
+        selected_features = filtered_cap_num.drop(columns=[target_column]).columns.tolist()
+    
+    st.write(f"Selected features: {', '.join(selected_features)}")
+    
+    # Train model with selected features
+    st.subheader("Linear Regression Model")
+    
+    RANDOM_SEED_VALUE = 13369770
+    np.random.seed(RANDOM_SEED_VALUE)
+    
+    X = filtered_cap_num[selected_features]
+    y = filtered_cap_num[target_column]
+    
+    # Check if we have enough data
+    if len(X) < 10:
+        st.error("Not enough data points for model training after filtering.")
+    else:
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=RANDOM_SEED_VALUE
+        )
         
-        # Correlation heatmap
-        st.subheader("Feature Correlation Matrix")
-        fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(filtered_cap_num.drop(columns=[target_column]).corr(), center=0, annot=True, cmap="coolwarm", ax=ax)
-        st.pyplot(fig)
+        # Option to normalize features
+        normalize_features = st.checkbox("Normalize features before training", value=True)
+        if normalize_features:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+            X_train_df = pd.DataFrame(X_train, columns=selected_features)
+            X_test_df = pd.DataFrame(X_test, columns=selected_features)
+        else:
+            X_train_df = X_train
+            X_test_df = X_test
         
         # Train model
-        st.subheader("Linear Regression Model")
+        try:
+            lr_model = LinearRegression()
+            lr_model.fit(X_train_df, y_train)
+            test_preds_lr = lr_model.predict(X_test_df)
+            train_preds_lr = lr_model.predict(X_train_df)
+            
+            # Model metrics
+            r2_train = r2_score(y_train, train_preds_lr)
+            r2_test = r2_score(y_test, test_preds_lr)
+            rmse_train = root_mean_squared_error(y_train, train_preds_lr)
+            rmse_test = root_mean_squared_error(y_test, test_preds_lr)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Train R²", f"{r2_train:.4f}")
+                st.metric("Test R²", f"{r2_test:.4f}")
+            with col2:
+                st.metric("Train RMSE", f"{rmse_train[0]:.4f}")
+                st.metric("Test RMSE", f"{rmse_test[0]:.4f}")
+            
+            # Check if R² is negative
+            if r2_test < 0:
+                st.error("""
+                Negative R² detected! This indicates the model performs worse than a horizontal line.
+                Possible reasons:
+                - The data might not have a linear relationship
+                - Features don't have predictive power
+                - The model is overfitting
+                - Outliers are affecting performance
+                
+                Try different features, removing outliers, or a different model type.
+                """)
+            
+            # Feature importance visualization
+            coefficients = lr_model.coef_
+            importance_df = pd.DataFrame({
+                "Feature": selected_features,
+                "Importance": coefficients
+            }).sort_values(by="Importance", ascending=False)
+            
+            st.subheader("Feature Importance (Linear Regression Coefficients)")
+            fig, ax = plt.subplots(figsize=(12, 8))
+            sns.barplot(x="Importance", y="Feature", data=importance_df, palette="viridis", ax=ax)
+            ax.set_title("Feature Importance for Predicting Average Rating", fontsize=15)
+            ax.set_xlabel("Coefficient Value", fontsize=12)
+            ax.set_ylabel("Feature", fontsize=12)
+            st.pyplot(fig)
+            
+            # Residual plot
+            st.subheader("Residual Analysis")
+            residuals = y_test - test_preds_lr
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.scatterplot(x=test_preds_lr, y=residuals, ax=ax)
+            ax.axhline(y=0, color='r', linestyle='-')
+            ax.set_title("Residual Plot", fontsize=15)
+            ax.set_xlabel("Predicted Values", fontsize=12)
+            ax.set_ylabel("Residuals", fontsize=12)
+            st.pyplot(fig)
+            
+            # Actual vs Predicted
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.scatterplot(x=y_test, y=test_preds_lr, ax=ax)
+            ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+            ax.set_title("Actual vs Predicted Values", fontsize=15)
+            ax.set_xlabel("Actual Values", fontsize=12)
+            ax.set_ylabel("Predicted Values", fontsize=12)
+            st.pyplot(fig)
+            
+        except Exception as e:
+            st.error(f"Error during Linear Regression training: {e}")
         
-        RANDOM_SEED_VALUE = 13369770
-        np.random.seed(RANDOM_SEED_VALUE)
+        # Try Random Forest as an alternative model
+        st.subheader("Random Forest Model as Alternative")
         
-        X_train, X_test, y_train, y_test = train_test_split(
-            filtered_cap_num.drop(columns=[target_column]), 
-            filtered_cap_num[target_column],
-            test_size=0.2,
-            random_state=RANDOM_SEED_VALUE
-        )
-        
-        lr_model = LinearRegression()
-        lr_model.fit(X_train, y_train)
-        test_preds_lr = lr_model.predict(X_test)
-        
-        # Model metrics
-        r2 = r2_score(y_test, test_preds_lr)
-        rmse = root_mean_squared_error(y_test, test_preds_lr)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("R² Score", f"{r2:.4f}")
-        with col2:
-            st.metric("RMSE", f"{rmse[0]:.4f}")
-        
-        # Feature importance visualization
-        coefficients = lr_model.coef_
-        importance_df = pd.DataFrame({
-            "Feature": filtered_cap_num.drop(columns=[target_column]).columns,
-            "Importance": coefficients
-        }).sort_values(by="Importance", ascending=False)
-        
-        st.subheader("Feature Importance (Linear Regression Coefficients)")
-        fig, ax = plt.subplots(figsize=(12, 8))
-        sns.barplot(x="Importance", y="Feature", data=importance_df, palette="viridis", ax=ax)
-        ax.set_title("Feature Importance for Predicting Average Rating", fontsize=15)
-        ax.set_xlabel("Coefficient Value", fontsize=12)
-        ax.set_ylabel("Feature", fontsize=12)
-        st.pyplot(fig)
-        
-        # Random Forest model with VIF reduction
-        st.subheader("Random Forest Model with Multicollinearity Reduction")
-        
-        X = filtered_cap_num.drop(columns=[target_column])
-        y = filtered_cap_num[target_column]
-        
-        vif_threshold = st.slider("VIF Threshold for Feature Selection", 
-                                min_value=1.0, max_value=10.0, value=4.0, step=0.5)
-        
-        reduced_data, vif_results = remove_high_vif_features(X, threshold=vif_threshold)
-        
-        if vif_results:
-            st.text("VIF Reduction Steps:")
-            for result in vif_results:
-                st.text(result)
-        
-        final_cols = reduced_data.columns
-        scaler = StandardScaler()
-        reduced_data_scaled = scaler.fit_transform(reduced_data)
-        
-        X_train, X_test, y_train, y_test = train_test_split(
-            reduced_data_scaled, 
-            y,
-            test_size=0.2,
-            random_state=RANDOM_SEED_VALUE
-        )
-        
-        rf_model = RandomForestRegressor(random_state=RANDOM_SEED_VALUE)
-        rf_model.fit(X_train, y_train)
-        
-        test_preds_rf = rf_model.predict(X_test)
-        
-        # RF Model metrics
-        r2_rf = r2_score(y_test, test_preds_rf)
-        rmse_rf = root_mean_squared_error(y_test, test_preds_rf)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("RF R² Score", f"{r2_rf:.4f}")
-        with col2:
-            st.metric("RF RMSE", f"{rmse_rf[0]:.4f}")
-        
-        # RF Feature importance
-        feature_importances = rf_model.feature_importances_
-        importance_df = pd.DataFrame({
-            "Feature": final_cols,
-            "Importance": feature_importances
-        }).sort_values(by="Importance", ascending=False)
-        
-        st.subheader("Feature Importance (Random Forest)")
-        fig, ax = plt.subplots(figsize=(12, 8))
-        sns.barplot(x="Importance", y="Feature", data=importance_df, palette="viridis", ax=ax)
-        ax.set_title("Feature Importance for Predicting Average Rating (Random Forest)", fontsize=15)
-        ax.set_xlabel("Importance", fontsize=12)
-        ax.set_ylabel("Feature", fontsize=12)
-        st.pyplot(fig)
+        try:
+            # Option to tune hyperparameters
+            n_estimators = st.slider("Number of trees", 10, 200, 100, 10)
+            max_depth = st.slider("Maximum tree depth", 2, 20, 10, 1)
+            
+            rf_model = RandomForestRegressor(
+                n_estimators=n_estimators, 
+                max_depth=max_depth,
+                random_state=RANDOM_SEED_VALUE
+            )
+            
+            rf_model.fit(X_train_df, y_train)
+            
+            test_preds_rf = rf_model.predict(X_test_df)
+            train_preds_rf = rf_model.predict(X_train_df)
+            
+            # RF Model metrics
+            r2_train_rf = r2_score(y_train, train_preds_rf)
+            r2_test_rf = r2_score(y_test, test_preds_rf)
+            rmse_train_rf = root_mean_squared_error(y_train, train_preds_rf)
+            rmse_test_rf = root_mean_squared_error(y_test, test_preds_rf)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("RF Train R²", f"{r2_train_rf:.4f}")
+                st.metric("RF Test R²", f"{r2_test_rf:.4f}")
+            with col2:
+                st.metric("RF Train RMSE", f"{rmse_train_rf[0]:.4f}")
+                st.metric("RF Test RMSE", f"{rmse_test_rf[0]:.4f}")
+            
+            # RF Feature importance
+            feature_importances = rf_model.feature_importances_
+            importance_df = pd.DataFrame({
+                "Feature": selected_features,
+                "Importance": feature_importances
+            }).sort_values(by="Importance", ascending=False)
+            
+            st.subheader("Feature Importance (Random Forest)")
+            fig, ax = plt.subplots(figsize=(12, 8))
+            sns.barplot(x="Importance", y="Feature", data=importance_df, palette="viridis", ax=ax)
+            ax.set_title("Feature Importance for Predicting Average Rating (Random Forest)", fontsize=15)
+            ax.set_xlabel("Importance", fontsize=12)
+            ax.set_ylabel("Feature", fontsize=12)
+            st.pyplot(fig)
+            
+            # Actual vs Predicted for RF
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.scatterplot(x=y_test, y=test_preds_rf, ax=ax)
+            ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+            ax.set_title("Actual vs Predicted Values (Random Forest)", fontsize=15)
+            ax.set_xlabel("Actual Values", fontsize=12)
+            ax.set_ylabel("Predicted Values", fontsize=12)
+            st.pyplot(fig)
+            
+        except Exception as e:
+            st.error(f"Error during Random Forest training: {e}")
         
     # TAB 4: Difficulty Analysis
     with tab4:
